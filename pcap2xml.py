@@ -88,7 +88,7 @@ def split_sessions(pcap_path):
 
 
 def main():
-    global delay_threshold, opt_force, opt_recursive
+    global delay_threshold, opt_force, opt_recursive, opt_service
     ap = argparse.ArgumentParser(description='pcap2xml')
     ap.add_argument('--delay_threshold', type=float, help='insert a <delay> element if the time interval between two I/O is larger than the specified value')
     ap.add_argument('-f', '--force', action='store_true', help='override existent XML files')
