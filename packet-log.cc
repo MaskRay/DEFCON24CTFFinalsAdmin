@@ -230,26 +230,35 @@ int main(int argc, char* argv[])
     if (fwrite(ETHERNET_HEADER, sizeof ETHERNET_HEADER-1, 1, fh) != 1) err(EX_IOERR, "fwrite");
 
     // IP header denoting 'side'
-    ip.id = htons(ip_id+=3);
+    ip.id = htons(ip_id++);
     ip.tot_len = htons(tot_len - (sizeof(ETHERNET_HEADER)-1));
     if (side) {
-      ip.saddr = 0xffffffff;
-      ip.daddr = 0x00000000;
+      //ip.saddr = 0xffffffff;
+      //ip.daddr = 0x00000000;
+      ip.saddr = htonl(~ connection_id);
+      ip.daddr = htonl(connection_id);
     } else {
-      ip.saddr = 0x00000000;
-      ip.daddr = 0xffffffff;
+      //ip.saddr = 0x00000000;
+      //ip.daddr = 0xffffffff;
+      ip.saddr = htonl(connection_id);
+      ip.daddr = htonl(~ connection_id);
     }
     //ip.check = in_cksum((unsigned short*)&ip, sizeof ip);
     if (fwrite(&ip, sizeof ip, 1, fh) != 1) err(EX_IOERR, "fwrite");
 
     // UDP header denoting 'connection_id'
     if (side) {
-      udp.source = htons(connection_id & 0xffff);
-      udp.dest = htons(connection_id >> 16 & 0xffff);
+      //udp.source = htons(connection_id & 0xffff);
+      //udp.dest = htons(connection_id >> 16 & 0xffff);
     } else {
-      udp.source = htons(connection_id >> 16 & 0xffff);
-      udp.dest = htons(connection_id & 0xffff);
+      //udp.source = htons(connection_id >> 16 & 0xffff);
+      //udp.dest = htons(connection_id & 0xffff);
     }
+
+    // if '!' is removed, wireshark may misidentify the direction of the first packet from the other side
+    udp.source = ! side ? 0xffff : 0;
+    udp.dest = ~ udp.source;
+
     udp.len = htons(ntohs(ip.tot_len) - sizeof ip);
     if (fwrite(&udp, sizeof udp, 1, fh) != 1) err(EX_IOERR, "fwrite");
 
