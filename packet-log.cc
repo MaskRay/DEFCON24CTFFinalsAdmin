@@ -3,6 +3,8 @@
 #endif
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
 #include <cctype>
 #include <fcntl.h>
 #include <cstdint>
@@ -20,11 +22,11 @@
 #include <unistd.h>
 using namespace std;
 
-// snapshot length == 1024
+// snapshot length == 65536
 // link-layer header type == 1 (Ethernet)
-const char PCAP_HEADER[] = "\xd4\xc3\xb2\xa1\x02\x00\x04\00\0\0\0\0\0\0\0\0\0\4\0\0\1\0\0\0";
+const char PCAP_HEADER[] = "\xd4\xc3\xb2\xa1\x02\x00\x04\00\0\0\0\0\0\0\0\0\0\0\1\0\1\0\0\0";
 // ethertype == 0xffff (unused)
-const char ETHERNET_HEADER[] = "\0\0\0\0\0\0\0\0\0\0\0\0\xff\xff";
+const char ETHERNET_HEADER[] = "\0\0\0\0\0\0\0\0\0\0\0\0\x08\x00";
 uint16_t udp_port = 1999;
 const int HEADER_LEN = 15;
 
@@ -66,7 +68,7 @@ int main(int argc, char* argv[])
 {
   int opt;
   bool opt_verbose = false;
-  long capture_buffer_size = 2*1024*1024;
+  long capture_buffer_size = 20*1024*1024;
   in_addr_t src_ip = ntohl(INADDR_ANY), listen_ip = ntohl(INADDR_ANY);
   static struct option long_options[] = {
     {"port",      required_argument, 0,   'p'},
@@ -113,6 +115,8 @@ int main(int argc, char* argv[])
     err(EX_OSERR, "open");
 
   map<int32_t, pair<int, FILE*>> csid2fd;
+
+  // bind
   char buf[65535-20-8];
   int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP), one = 1;
   if (fd < 0) err(EX_OSERR, "socket");
@@ -124,6 +128,24 @@ int main(int argc, char* argv[])
   sa.sin_port = htons(udp_port);
   if (bind(fd, (sockaddr*)&sa, sizeof sa) < 0)
     err(EX_OSERR, "bind");
+
+  // default values for IP & UDP headers
+  uint16_t ip_id = 0;
+  iphdr ip = {};
+  ip.ihl = 5;
+  ip.version = 4;
+  //ip.tot_len;
+  //ip.id;
+  ip.frag_off = 0;
+  ip.ttl = 64;
+  ip.protocol = IPPROTO_UDP;
+  ip.frag_off = htons(IP_DF);
+  //ip.check
+  //ip.saddr
+  //ip.daddr
+
+  udphdr udp = {};
+
   for(;;) {
     ssize_t len;
     msghdr msg;
@@ -159,24 +181,29 @@ int main(int argc, char* argv[])
     }
 
     uint32_t csid = *(uint32_t*)buf;
-    // uint32_t connection_id = *(uint32_t*)(buf+4);
-    // uint32_t msg_id = *(uint32_t*)(buf+8);
+    uint32_t connection_id = *(uint32_t*)(buf+4);
+    uint32_t msg_id = *(uint32_t*)(buf+8);
     uint16_t msg_len = *(uint16_t*)(buf+12);
-    // char side = *(char*)(buf+14);
+    char side = *(char*)(buf+14);
     if (msg_len != len-HEADER_LEN) {
       if (opt_verbose)
         fprintf(stderr, "invalid message, actual: %ld, expected: %" PRIu16 "\n", len-HEADER_LEN, msg_len);
       continue;
     }
+
+    // ensure sub directory
     if (! csid2fd.count(csid)) {
       sprintf(tmp, "%" PRIu32, csid);
-      int dir = mkdirat(root_dir, tmp, 0777);
-      if (dir < 0 && errno == EEXIST)
-        dir = openat(root_dir, tmp, O_RDONLY | O_DIRECTORY);
-      if (dir < 0)
+      errno = 0;
+      if (mkdirat(root_dir, tmp, 0777) < 0 && errno != EEXIST)
         err(EX_OSERR, "mkdirat");
+      int dir = openat(root_dir, tmp, O_RDONLY | O_DIRECTORY);
+      if (dir < 0)
+        err(EX_OSERR, "openat");
       csid2fd[csid] = {dir, NULL};
     }
+
+    // ensure PCAP file in sub directory
     if (! csid2fd[csid].second) {
       time_t t = ts.tv_sec;
       strftime(tmp, sizeof tmp, "%Y%m%d-%H%M%S.cap", localtime(&t));
@@ -188,15 +215,45 @@ int main(int argc, char* argv[])
       if (fwrite(PCAP_HEADER, sizeof PCAP_HEADER-1, 1, fh) != 1)
         err(EX_IOERR, "fwrite");
     }
+
     FILE* fh = csid2fd[csid].second;
+    // pcap-savefile timestamp
     if (fwrite(&ts.tv_sec, 4, 1, fh) != 1) err(EX_IOERR, "fwrite");
     if (fwrite(&ts.tv_usec, 4, 1, fh) != 1) err(EX_IOERR, "fwrite");
-    len += sizeof(ETHERNET_HEADER)-1;
-    if (fwrite(&len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // length of captured packet data
-    if (fwrite(&len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // un-truncated length of captured packet data
+
+    // pcap-savefile length
+    uint32_t tot_len = sizeof(ETHERNET_HEADER)-1 + sizeof(iphdr) + sizeof(udphdr) + len-HEADER_LEN;
+    if (fwrite(&tot_len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // length of captured packet data
+    if (fwrite(&tot_len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // un-truncated length of captured packet data
+
+    // Ethernet header
     if (fwrite(ETHERNET_HEADER, sizeof ETHERNET_HEADER-1, 1, fh) != 1) err(EX_IOERR, "fwrite");
-    len -= sizeof(ETHERNET_HEADER)-1;
-    if (fwrite(buf, len, 1, fh) != 1) err(EX_IOERR, "fwrite");
+
+    // IP header denoting 'side'
+    ip.id = htons(ip_id+=3);
+    ip.tot_len = htons(tot_len - (sizeof(ETHERNET_HEADER)-1));
+    if (side) {
+      ip.saddr = 0xffffffff;
+      ip.daddr = 0x00000000;
+    } else {
+      ip.saddr = 0x00000000;
+      ip.daddr = 0xffffffff;
+    }
+    //ip.check = in_cksum((unsigned short*)&ip, sizeof ip);
+    if (fwrite(&ip, sizeof ip, 1, fh) != 1) err(EX_IOERR, "fwrite");
+
+    // UDP header denoting 'connection_id'
+    if (side) {
+      udp.source = htons(connection_id & 0xffff);
+      udp.dest = htons(connection_id >> 16 & 0xffff);
+    } else {
+      udp.source = htons(connection_id >> 16 & 0xffff);
+      udp.dest = htons(connection_id & 0xffff);
+    }
+    udp.len = htons(ntohs(ip.tot_len) - sizeof ip);
+    if (fwrite(&udp, sizeof udp, 1, fh) != 1) err(EX_IOERR, "fwrite");
+
+    if (fwrite(buf+HEADER_LEN, len-HEADER_LEN, 1, fh) != 1) err(EX_IOERR, "fwrite");
     if (ftello(fh) > capture_buffer_size) {
       if (fclose(fh) < 0) err(EX_IOERR, "fclose");
       csid2fd[csid].second = NULL;
