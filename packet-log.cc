@@ -2,19 +2,20 @@
 # define _GNU_SOURCE
 #endif
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <netdb.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
-#include <cctype>
 #include <fcntl.h>
-#include <cstdint>
-#include <cstdio>
 #include <err.h>
 #include <errno.h>
 #include <getopt.h>
 #include <cinttypes>
 #include <map>
 #include <netinet/in.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sysexits.h>
