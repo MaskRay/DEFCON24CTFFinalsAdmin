@@ -13,6 +13,7 @@ if not any(os.access(os.path.join(path, 'tshark'), os.X_OK) for path in os.envir
     sys.exit(1)
 
 DEVNULL = open(os.devnull, 'r+b')
+# Ref: https://www.wireshark.org/docs/dfref/t/tcp.html
 TCP_IGNORE = '!tcp.analysis.ack_lost_segment and !tcp.analysis.duplicate_ack and !tcp.analysis.retransmission'
 delay_threshold = 0.1
 opt_force = False
@@ -26,39 +27,51 @@ def to_xml_path(pcap_path, i):
 
 
 def split_sessions(pcap_path):
-    # Ref: https://www.wireshark.org/docs/dfref/t/tcp.html
-    tshark_output = subprocess.check_output(['tshark', '-r', pcap_path, '-2R', TCP_IGNORE, '-T', 'fields', '-e', 'tcp.stream'], stderr=DEVNULL)
     sessions = {}
+    ethernet_ip = False
     with open(pcap_path) as f:
-        for (ts, pkt), stream_id in izip(dpkt.pcap.Reader(f).readpkts(), tshark_output.splitlines()):
-            if len(stream_id) == 0: continue
-            stream_id = int(stream_id)
-            ether = dpkt.ethernet.Ethernet(pkt)
-            if ether.type != 2048: continue # not IP
-            ip = ether.data
-            if not hasattr(ip, 'tcp'): continue # not TCP
-            tcp = ip.tcp
-            client_ip = struct.unpack('>I', ip.src)[0]
-            server_ip = struct.unpack('>I', ip.dst)[0]
-            if stream_id not in sessions:
-                sessions[stream_id] = {'client_ip': client_ip,
-                                      'server_ip': server_ip,
-                                      'client_port': tcp.sport,
-                                      'server_port': tcp.dport,
-                                      'packets': [(ts, ip)]}
-            else:
-                sessions[stream_id]['packets'].append((ts, ip))
-            if tcp.flags & dpkt.tcp.TH_SYN and not (tcp.flags & dpkt.tcp.TH_ACK):
-                sessions[stream_id]['has_begin'] = True
-            if tcp.flags & dpkt.tcp.TH_FIN or tcp.flags & dpkt.tcp.TH_RST:
-                sessions[stream_id]['has_end'] = True
-
-
+        frames = dpkt.pcap.Reader(f).readpkts()
+        # custom ethertype, key is 'stream_id'
+        if len(frames) and dpkt.ethernet.Ethernet(frames[0][1]).type == 0xffff: # custom ethertype
+            for ts, pkt in frames:
+                ether = dpkt.ethernet.Ethernet(pkt)
+                csid, connection_id, msg_id, msg_len, side = struct.unpack('IIIHB', ether.data[:15])
+                if connection_id not in sessions:
+                    sessions[connection_id] = {'client_ip': 0,
+                                               'server_ip': 1,
+                                               'packets': [(ts, ether.data)]}
+                else:
+                    sessions[connection_id]['packets'].append((ts, ether.data))
+        # ETHERTYPE_IP, key is 'tcp.stream' printed by tshark
+        else:
+            ethernet_ip = True
+            tshark_output = subprocess.check_output(['tshark', '-r', pcap_path, '-2R', TCP_IGNORE, '-T', 'fields', '-e', 'tcp.stream'], stderr=DEVNULL)
+            for (ts, pkt), stream_id in izip(frames, tshark_output.splitlines()):
+                if len(stream_id) == 0: continue
+                stream_id = int(stream_id)
+                ether = dpkt.ethernet.Ethernet(pkt)
+                if ether.type != 2048: continue # not IP
+                ip = ether.data
+                if not hasattr(ip, 'tcp'): continue # not TCP
+                tcp = ip.tcp
+                client_ip = struct.unpack('>I', ip.src)[0]
+                server_ip = struct.unpack('>I', ip.dst)[0]
+                if stream_id not in sessions:
+                    sessions[stream_id] = {'client_ip': client_ip,
+                                           'server_ip': server_ip,
+                                           'packets': [(ts, ip)]}
+                else:
+                    sessions[stream_id]['packets'].append((ts, ip))
+                if tcp.flags & dpkt.tcp.TH_SYN and not (tcp.flags & dpkt.tcp.TH_ACK):
+                    sessions[stream_id]['has_begin'] = True
+                if tcp.flags & dpkt.tcp.TH_FIN or tcp.flags & dpkt.tcp.TH_RST:
+                    sessions[stream_id]['has_end'] = True
 
     i = 0
     for session in sessions.itervalues():
-        if not ('has_begin' in session and 'has_end' in session):
-            continue
+        if ethernet_ip:
+            if not ('has_begin' in session and 'has_end' in session):
+                continue
 
         # Header
         # Ref: https://github.com/CyberGrandChallenge/cgc-release-documentation/blob/master/pov-markup-spec.txt
@@ -76,28 +89,34 @@ def split_sessions(pcap_path):
         # I/O
         first = True
         last = 0
-        for ts, ip in session['packets']:
-            tcp = ip.tcp
-            if len(tcp.data) > 0:
-                if struct.unpack('>I', ip.src)[0] == session['client_ip']:
+        for ts, pkt in session['packets']:
+            if ethernet_ip:
+                src_ip = struct.unpack('>I', ip.src)[0]
+                ip = pkt
+                data = ip.tcp.data
+            else:
+                src_ip = struct.unpack('B', pkt[14])[0] # side, 0: from client
+                data = pkt[15:]
+            if len(data) > 0:
+                if src_ip == session['client_ip']:
                     if ts-last > delay_threshold and not first:
                         delay = etree.Element('delay')
                         delay.text = str(int(round((ts-last)*1000)))
                         replay.append(delay)
                     payload = ''
                     node = etree.Element('write')
-                    data = etree.Element('data')
-                    for c in tcp.data:
+                    write_data = etree.Element('data')
+                    for c in data:
                         if 33 <= ord(c) < 127 and c not in '&<>':
                             payload += c
                         else:
                             payload += '\\x%0*x' % (2, ord(c))
-                    data.text = payload
-                    node.append(data)
+                    write_data.text = payload
+                    node.append(write_data)
                 else:
                     node = etree.Element('read')
                     length = etree.Element('length')
-                    length.text = str(len(tcp.data))
+                    length.text = str(len(data))
                     node.append(length)
                 replay.append(node)
                 first = False
@@ -125,12 +144,16 @@ def main():
     global delay_threshold, opt_cfe_pov, opt_force, opt_recursive, opt_service
     ap = argparse.ArgumentParser(description='pcap2xml',
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog='''
+Ethernet-IP-TCP packets (captured by tcpdump, dumpcap...) and ethertype 0xffff packets (by cb-packet-log) are both supported.
+
+Examples:
 ./pcap2xml.py /tmp/a.pcap /tmp/b.cap # /tmp/a.pcap -> /tmp/a.xml ; /tmp/b.cap -> /tmp/b.xml
 ./pcap2xml.py /tmp/dir/ # /tmp/dir/*.(cap|pcap) -> /tmp/dir/*.$session_id.xml
 ./pcap2xml.py -c /tmp/dir/ # <!DOCTYPE cfe-pov SYSTEM "/usr/share/cgc-docs/cfe-pov.dtd">
 ./pcap2xml.py -d 0.1 /tmp/dir/ # time intervals between two I/O operations greater than 0.1s are treated as <delay> elements
 ./pcap2xml.py -r /tmp/dir/ # /tmp/dir/**/*.(cap|pcap) -> /tmp/dir/**/*.$session_id.xml
-./pcap2xml.py -s service # <cbid>$service</cbid>
+./pcap2xml.py -s service /tmp/dir # <cbid>$service</cbid>
+./pcap2xml.py -p 4 /tmp/dir # 4 parallel workers
 ''')
     ap.add_argument('-c', '--cfe-pov', action='store_true', help='generate XML files of type cfe-pov.dtd (<cfepov>)')
     ap.add_argument('-d', '--delay-threshold', type=float, help='insert a <delay> element if the time interval between two I/O is larger than the specified value')
