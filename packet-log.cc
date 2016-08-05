@@ -35,7 +35,8 @@ void print_help(FILE *fh)
         "\n"
         "Options:\n"
         "  -B %ld                    capture buffer size in MiB (default: 2), create a new PCAP if it is larger than this size\n"
-        "  -p, --port %s             port of listening UDP socket\n"
+        "  -l, --listen %s           UDP listen address\n"
+        "  -p, --port %s             UDP listen port\n"
         "  -s, --src %s              trusted source IP, packets from others will be dropped\n"
         "  -v, --verbose             verbose\n"
         "  -h, --help                display this help and exit\n"
@@ -47,21 +48,36 @@ void print_help(FILE *fh)
   exit(fh == stdout ? 0 : EX_USAGE);
 }
 
+in_addr_t resolve_ip(const char *s)
+{
+  in_addr_t r = 0;
+  addrinfo hint = {}, *res;
+  hint.ai_family = AF_INET;
+  hint.ai_socktype = SOCK_DGRAM;
+  if (getaddrinfo(optarg, NULL, &hint, &res))
+    err(EX_OSERR, "getaddrinfo");
+  for (addrinfo* rp = res; rp; rp = rp->ai_next)
+    r = ntohl(((struct sockaddr_in*)rp->ai_addr)->sin_addr.s_addr);
+  freeaddrinfo(res);
+  return r;
+}
+
 int main(int argc, char* argv[])
 {
   int opt;
   bool opt_verbose = false;
   long capture_buffer_size = 2*1024*1024;
-  in_addr_t src_ip = ntohl(INADDR_ANY);
+  in_addr_t src_ip = ntohl(INADDR_ANY), listen_ip = ntohl(INADDR_ANY);
   static struct option long_options[] = {
     {"port",      required_argument, 0,   'p'},
     {"src",       required_argument, 0,   's'},
+    {"listen",    required_argument, 0,   'l'},
     {"verbose",   required_argument, 0,   'v'},
     {"help",      required_argument, 0,   'h'},
     {0,           0,                 0,   0},
   };
 
-  while ((opt = getopt_long(argc, argv, "B:hp:s:v", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "B:hl:p:s:v", long_options, NULL)) != -1) {
     switch (opt) {
     case 'B':
       capture_buffer_size = atol(optarg)*1024*1024;
@@ -69,20 +85,15 @@ int main(int argc, char* argv[])
     case 'h':
       print_help(stdout);
       break;
+    case 'l':
+      listen_ip = resolve_ip(optarg);
+      break;
     case 'p':
       udp_port = atoi(optarg);
       break;
-    case 's': {
-      addrinfo hint = {}, *res;
-      hint.ai_family = AF_INET;
-      hint.ai_socktype = SOCK_DGRAM;
-      if (getaddrinfo(optarg, NULL, &hint, &res))
-        err(EX_OSERR, "getaddrinfo");
-      for (addrinfo* rp = res; rp; rp = rp->ai_next)
-        src_ip = ntohl(((struct sockaddr_in*)rp->ai_addr)->sin_addr.s_addr);
-      freeaddrinfo(res);
+    case 's':
+      src_ip = resolve_ip(optarg);
       break;
-    }
     case 'v':
       opt_verbose = true;
       break;
@@ -108,7 +119,8 @@ int main(int argc, char* argv[])
   if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof one) < 0)
     err(EX_OSERR, "setsockopt");
   sockaddr_in sa = {}, src_sa;
-  sa.sin_addr.s_addr = htonl(INADDR_ANY);
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(listen_ip);
   sa.sin_port = htons(udp_port);
   if (bind(fd, (sockaddr*)&sa, sizeof sa) < 0)
     err(EX_OSERR, "bind");
