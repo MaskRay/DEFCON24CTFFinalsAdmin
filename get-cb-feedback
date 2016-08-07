@@ -1,0 +1,30 @@
+#!/bin/zsh
+file=data/cb-feedback.tsv
+
+cd $(dirname "$0")
+mkdir -p data
+
+#for round in $(seq 92 102); do
+#  json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/feedback/cb")
+#  if [[ -n $json ]]; then
+#    if [[ ! -f $file ]]; then
+#      echo 'round\ttimestamp\tsignal\tcsid\tcbid' > $file
+#    fi
+#    jq -r '.cb[]|"'$round'\t\(.timestamp)\t\(.signal)\t\(.csid)\t\(.cbid)"' <<< $json >> $file
+#  fi
+#done
+
+while :; do
+  json=$(curl -sS 'http://bloop:neiman marcus and 654321 on rye@10.3.1.21/status')
+  round=$(jq .round <<< $json)
+  if [[ $round =~ [0-9]+ ]]; then
+    json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/feedback/cb")
+    if [[ ! -f $file ]]; then
+      echo 'round\ttimestamp\tsignal\tcsid\tcbid' > $file
+    fi
+    if [[ $(tail -n1 $file | cut -f1) != $round ]]; then
+      jq -r '.cb[]|"'$round'\t\(.timestamp)\t\(.signal)\t\(.csid)\t\(.cbid)"' <<< $json >> $file
+    fi
+  fi
+  sleep 100
+done

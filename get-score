@@ -1,0 +1,19 @@
+#!/bin/zsh
+file=data/score.tsv
+
+cd $(dirname "$0")
+mkdir -p data
+
+while :; do
+  json=$(curl -sS 'http://bloop:neiman marcus and 654321 on rye@10.3.1.21/status')
+  round=$(jq .round <<< $json)
+  if [[ $round =~ [0-9]+ ]]; then
+    if [[ ! -f $file ]]; then
+      echo 'round\tteam\tscore\trank\tplace' > $file
+    fi
+    if [[ $(tail -n1 $file | cut -f1) != $round ]]; then
+      jq -r '.scores[]|"'$round'\t\(.team)\t\(.score)\t\(.rank)\t\(.place)"' <<< $json >> $file
+    fi
+  fi
+  sleep 100
+done

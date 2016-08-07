@@ -1,0 +1,24 @@
+#!/bin/zsh
+file=data/pov-feedback.tsv
+
+cd $(dirname "$0")
+mkdir -p data
+
+#for round in $(seq 1 90); do
+#  json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/feedback/pov")
+#  if [[ -n $json ]]; then
+#    jq -r '.pov[]|"'$round'\t\(.throw)\t\(.team)\t\(.result)\t\(.error)\t\(.csid)"' <<< $json >> $file
+#  fi
+#done
+
+while :; do
+  json=$(curl -sS 'http://bloop:neiman marcus and 654321 on rye@10.3.1.21/status')
+  round=$(jq .round <<< $json)
+  if [[ $round =~ [0-9]+ ]]; then
+    json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/feedback/pov")
+    if [[ $(tail -n1 $file | cut -f1) != $round ]]; then
+      jq -r '.pov[]|"'$round'\t\(.throw)\t\(.team)\t\(.result)\t\(.error)\t\(.csid)"' <<< $json >> $file
+    fi
+  fi
+  sleep 100
+done

@@ -1,0 +1,37 @@
+#!/bin/zsh
+prefix=data/consensus-cb
+
+cd $(dirname "$0")
+mkdir -p data
+
+#for round in $(seq 96 97); do
+#  for team in $(seq 15); do
+#    json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/evaluation/cb/$team")
+#    file=$prefix.$team.tsv
+#    if [[ ! -f $file ]]; then
+#      echo 'round\turi\thash\tcsid\tcbid' > $file
+#    fi
+#    if [[ -n $json ]]; then
+#      echo $json
+#      jq -r '.cb[]|"'$round'\t\(.uri)\t\(.hash)\t\(.csid)\t\(.cbid)"' <<< $json >> $file
+#    fi
+#  done
+#done
+
+while :; do
+  json=$(curl -sS 'http://bloop:neiman marcus and 654321 on rye@10.3.1.21/status')
+  round=$(jq .round <<< $json)
+  if [[ $round =~ [0-9]+ ]]; then
+    for team in $(seq 15); do
+      json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/evaluation/cb/$team")
+      file=$prefix.$team.tsv
+      if [[ ! -f $file ]]; then
+        echo 'round\turi\thash\tcsid\tcbid' > $file
+      fi
+      if [[ $(tail -n1 $file | cut -f1) != $round ]]; then
+        jq -r '.cb[]|"'$round'\t\(.uri)\t\(.hash)\t\(.csid)\t\(.cbid)"' <<< $json >> $file
+      fi
+    done
+  fi
+  sleep 100
+done
