@@ -1,0 +1,61 @@
+#!/bin/zsh
+#action=echo
+action=~/DEF/cgc/raybot.py
+
+declare -A state
+declare -A state2
+declare -A name
+name[1]=CGC
+name[2]=DEFKOR
+name[3]='ESPR'
+name[4]=b1o0p
+name[5]=pasten
+name[6]=HITCON
+name[7]=LCBC
+name[8]=PPP
+name[9]=Samurai
+name[10]=9447
+name[11]=KaisHackGoN
+name[12]=binja
+name[13]=Shellphish
+name[14]=DragonSector
+name[15]=SpamAndHex
+
+cnt=0
+while :; do
+  json=$(curl -sS 'http://bloop:neiman marcus and 654321 on rye@10.3.1.21/status')
+  round=$(jq .round <<< $json)
+  if [[ $round =~ [0-9]+ ]]; then
+    json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/feedback/pov")
+    echo $round $json
+    if [[ -n $json ]]; then
+      success=()
+      fail=()
+      state2=()
+      jq -r '.pov[]|"\(.throw)\t\(.team)\t\(.result)\t\(.error)\t\(.csid)"' <<< $json | while read throw team result error csid; do
+        if [[ $result == success || ${state2[$csid.$team]} != success ]]; then
+          state2[$csid.$team]=$result
+        fi
+      done
+
+      jq -r '.pov[]|"\(.team)\t\(.csid)"' <<< $json | sort -u | while read team csid; do
+        if [[ ${state[$csid.$team]} != ${state2[$csid.$team]} ]]; then
+          if [[ ${state2[$csid.$team]} == success ]]; then
+            success=("${success[@]}" $csid:${name[$team]})
+          else
+            fail=("${fail[@]}" $csid:${name[$team]})
+          fi
+        fi
+      done
+
+      state=("${(kv)state2[@]}")
+
+      if (( cnt > 0)); then
+        if (( $#success > 0 )); then $action "fail->success: ${(o)success[*]}"; fi
+        if (( $#fail > 0 )); then $action "success->fail: ${(o)fail[*]}"; fi
+      fi
+      ((cnt++))
+    fi
+  fi
+  sleep 60
+done

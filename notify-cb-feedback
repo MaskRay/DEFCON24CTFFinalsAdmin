@@ -1,0 +1,28 @@
+#!/bin/zsh
+#action=echo
+action=~/DEF/cgc/raybot.py
+
+declare -A state
+
+cnt=0
+while :; do
+  json=$(curl -sS 'http://bloop:neiman marcus and 654321 on rye@10.3.1.21/status')
+  round=$(jq .round <<< $json)
+  if [[ $round =~ [0-9]+ ]]; then
+    json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/feedback/cb")
+    if [[ -n $json ]]; then
+      sign=()
+      jq -r '.cb[]|"\(.timestamp)\t\(.signal)\t\(.csid)\t\(.cbid)"' <<< $json | while read timestamp signal csid cbid; do
+        if [[ ${state[$csid]} != $signal ]]; then
+          sign=("${sign[@]}" $csid:$signal)
+          state[$csid]=$signal
+        fi
+      done
+      if ((cnt > 0)); then
+        if (( $#sig > 0 )); then $action "signal: ${(o)sign[*]}"; fi
+      fi
+      ((cnt++))
+    fi
+  fi
+  sleep 100
+done
