@@ -51,8 +51,8 @@ while :; do
       state=("${(kv)state2[@]}")
 
       if (( cnt > 0)); then
-        if (( $#success > 0 )); then $action "fail->success: ${(o)success[*]}"; fi
-        if (( $#fail > 0 )); then $action "success->fail: ${(o)fail[*]}"; fi
+        if (( $#success > 0 )); then $action "round: $round fail->success: ${(o)success[*]}"; fi
+        if (( $#fail > 0 )); then $action "round: $round success->fail: ${(o)fail[*]}"; fi
       fi
       ((cnt++))
     fi

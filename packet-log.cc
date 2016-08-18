@@ -16,8 +16,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sysexits.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,7 +40,8 @@ void print_help(FILE *fh)
   fputs(
         "\n"
         "Options:\n"
-        "  -B %ld                    capture buffer size in MiB (default: 2), create a new PCAP if it is larger than this size\n"
+        "  -B %ld                    capture buffer size in MiB (default: 2), switch to the next PCAP after it reaches a size of %ld MiB\n"
+        "  -d, --duration %ld        round duration in seconds (default: 300), switch to the next PCAP after %ld seconds have elapsed\n"
         "  -l, --listen %s           UDP listen address\n"
         "  -p, --port %s             UDP listen port\n"
         "  -s, --src %s              trusted source IP, packets from others will be dropped\n"
@@ -65,13 +69,29 @@ in_addr_t resolve_ip(const char *s)
   return r;
 }
 
+void create_pcap(map<int32_t, pair<int, FILE*>>& csid2fd, int csid, timeval ts)
+{
+  char tmp[99];
+  time_t t = ts.tv_sec;
+  strftime(tmp, sizeof tmp, "%Y%m%d-%H%M%S.cap", localtime(&t));
+  int file = openat(csid2fd[csid].first, tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (file < 0) err(EX_IOERR, "openat");
+  FILE* fh = fdopen(file, "wb");
+  if (! fh) err(EX_IOERR, "fdopen");
+  csid2fd[csid].second = fh;
+  if (fwrite(PCAP_HEADER, sizeof PCAP_HEADER-1, 1, fh) != 1)
+    err(EX_IOERR, "fwrite");
+}
+
 int main(int argc, char* argv[])
 {
   int opt;
   bool opt_verbose = false;
-  long capture_buffer_size = 20*1024*1024;
+  long capture_buffer_size = 20*1024*1024,
+       duration = 5*60;
   in_addr_t src_ip = ntohl(INADDR_ANY), listen_ip = ntohl(INADDR_ANY);
   static struct option long_options[] = {
+    {"duration",  required_argument, 0,   'd'},
     {"port",      required_argument, 0,   'p'},
     {"src",       required_argument, 0,   's'},
     {"listen",    required_argument, 0,   'l'},
@@ -80,10 +100,13 @@ int main(int argc, char* argv[])
     {0,           0,                 0,   0},
   };
 
-  while ((opt = getopt_long(argc, argv, "B:hl:p:s:v", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "B:d:hl:p:s:v", long_options, NULL)) != -1) {
     switch (opt) {
     case 'B':
       capture_buffer_size = atol(optarg)*1024*1024;
+      break;
+    case 'd':
+      duration = atol(optarg);
       break;
     case 'h':
       print_help(stdout);
@@ -147,128 +170,143 @@ int main(int argc, char* argv[])
 
   udphdr udp = {};
 
+  // timer
+  itimerspec itimer = {};
+  itimer.it_value.tv_sec = itimer.it_interval.tv_sec = duration;
+  int timer = timerfd_create(CLOCK_REALTIME, 0);
+  if (timer < 0)
+    err(EX_OSERR, "timerfd_create");
+  if (timerfd_settime(timer, 0, &itimer, NULL) == -1)
+    err(EX_OSERR, "timerfd_settime");
+
+  pollfd fds[2];
+  fds[0].fd = fd;
+  fds[0].events = POLLIN;
+  fds[1].fd = timer;
+  fds[1].events = POLLIN;
   for(;;) {
-    ssize_t len;
-    msghdr msg;
-    char tmp[512];
+    int ready = poll(fds, 2, -1);
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      err(EX_OSERR, "poll");
+    }
     timeval ts;
-    iovec iov = {};
-    iov.iov_base = buf;
-    iov.iov_len = sizeof buf;
-    msg.msg_name = &src_sa;
-    msg.msg_namelen = sizeof src_sa;
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = tmp;
-    msg.msg_controllen = sizeof tmp;
-    if ((len = recvmsg(fd, &msg, 0)) < 0)
-      err(EX_OSERR, "rercvmsg");
-    if (src_ip != ntohl(INADDR_ANY) && src_ip != ntohl(src_sa.sin_addr.s_addr)) {
-      if (opt_verbose) {
-        if (! inet_ntop(AF_INET, &src_sa.sin_addr, tmp, sizeof tmp))
-          err(EX_OSERR, "inet_ntop");
-        fprintf(stderr, "dropped packet from %s\n", tmp);
+
+    if (fds[1].revents & POLLIN) {
+      int64_t elapsed;
+      if (read(timer, &elapsed, sizeof(int64_t)) < 0)
+        err(EX_OSERR, "read");
+      for (auto& it: csid2fd) {
+        if (it.second.second) {
+          if (fclose(it.second.second) < 0) err(EX_IOERR, "fclose");
+          gettimeofday(&ts, NULL);
+          create_pcap(csid2fd, it.first, ts);
+        }
       }
-      continue;
-    }
-    // read timestamp
-    for (cmsghdr* i = CMSG_FIRSTHDR(&msg); i; i = CMSG_NXTHDR(&msg, i))
-      if (i->cmsg_level == SOL_SOCKET && i->cmsg_type == SO_TIMESTAMP)
-        ts = *(timeval*)CMSG_DATA(i);
-    if (len < HEADER_LEN) {
-      if (opt_verbose)
-        fprintf(stderr, "invalid message length: %ld\n", len);
-      continue;
     }
 
-    uint32_t csid = *(uint32_t*)buf;
-    uint32_t connection_id = *(uint32_t*)(buf+4);
-    uint32_t msg_id = *(uint32_t*)(buf+8);
-    uint16_t msg_len = *(uint16_t*)(buf+12);
-    char side = *(char*)(buf+14);
-    if (msg_len != len-HEADER_LEN) {
-      if (opt_verbose)
-        fprintf(stderr, "invalid message, actual: %ld, expected: %" PRIu16 "\n", len-HEADER_LEN, msg_len);
-      continue;
-    }
+    if (fds[0].revents & POLLIN) {
+      ssize_t len;
+      msghdr msg;
+      char tmp[512];
+      iovec iov = {};
+      iov.iov_base = buf;
+      iov.iov_len = sizeof buf;
+      msg.msg_name = &src_sa;
+      msg.msg_namelen = sizeof src_sa;
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      msg.msg_control = tmp;
+      msg.msg_controllen = sizeof tmp;
+      if ((len = recvmsg(fd, &msg, 0)) < 0)
+        err(EX_OSERR, "recvmsg");
+      if (src_ip != ntohl(INADDR_ANY) && src_ip != ntohl(src_sa.sin_addr.s_addr)) {
+        if (opt_verbose) {
+          if (! inet_ntop(AF_INET, &src_sa.sin_addr, tmp, sizeof tmp))
+            err(EX_OSERR, "inet_ntop");
+          fprintf(stderr, "dropped packet from %s\n", tmp);
+        }
+        continue;
+      }
+      // read timestamp
+      for (cmsghdr* i = CMSG_FIRSTHDR(&msg); i; i = CMSG_NXTHDR(&msg, i))
+        if (i->cmsg_level == SOL_SOCKET && i->cmsg_type == SO_TIMESTAMP)
+          ts = *(timeval*)CMSG_DATA(i);
+      if (len < HEADER_LEN) {
+        if (opt_verbose)
+          fprintf(stderr, "invalid message length: %ld\n", len);
+        continue;
+      }
 
-    // ensure sub directory
-    if (! csid2fd.count(csid)) {
-      sprintf(tmp, "%" PRIu32, csid);
-      errno = 0;
-      if (mkdirat(root_dir, tmp, 0777) < 0 && errno != EEXIST)
-        err(EX_OSERR, "mkdirat");
-      int dir = openat(root_dir, tmp, O_RDONLY | O_DIRECTORY);
-      if (dir < 0)
-        err(EX_OSERR, "openat");
-      csid2fd[csid] = {dir, NULL};
-    }
+      uint32_t csid = *(uint32_t*)buf;
+      uint32_t connection_id = *(uint32_t*)(buf+4);
+      uint32_t msg_id = *(uint32_t*)(buf+8);
+      uint16_t msg_len = *(uint16_t*)(buf+12);
+      char side = *(char*)(buf+14);
+      if (msg_len != len-HEADER_LEN) {
+        if (opt_verbose)
+          fprintf(stderr, "invalid message, actual: %ld, expected: %" PRIu16 "\n", len-HEADER_LEN, msg_len);
+        continue;
+      }
 
-    // ensure PCAP file in sub directory
-    if (! csid2fd[csid].second) {
-      time_t t = ts.tv_sec;
-      strftime(tmp, sizeof tmp, "%Y%m%d-%H%M%S.cap", localtime(&t));
-      int file = openat(csid2fd[csid].first, tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-      if (file < 0) err(EX_IOERR, "openat");
-      FILE* fh = fdopen(file, "wb");
-      if (! fh) err(EX_IOERR, "fdopen");
-      csid2fd[csid].second = fh;
-      if (fwrite(PCAP_HEADER, sizeof PCAP_HEADER-1, 1, fh) != 1)
-        err(EX_IOERR, "fwrite");
-    }
+      // ensure sub directory
+      if (! csid2fd.count(csid)) {
+        sprintf(tmp, "%" PRIu32, csid);
+        errno = 0;
+        if (mkdirat(root_dir, tmp, 0777) < 0 && errno != EEXIST)
+          err(EX_OSERR, "mkdirat");
+        int dir = openat(root_dir, tmp, O_RDONLY | O_DIRECTORY);
+        if (dir < 0)
+          err(EX_OSERR, "openat");
+        csid2fd[csid] = {dir, NULL};
+      }
 
-    FILE* fh = csid2fd[csid].second;
-    // pcap-savefile timestamp
-    if (fwrite(&ts.tv_sec, 4, 1, fh) != 1) err(EX_IOERR, "fwrite");
-    if (fwrite(&ts.tv_usec, 4, 1, fh) != 1) err(EX_IOERR, "fwrite");
+      // ensure PCAP file in sub directory
+      if (! csid2fd[csid].second)
+        create_pcap(csid2fd, csid, ts);
 
-    // pcap-savefile length
-    uint32_t tot_len = sizeof(ETHERNET_HEADER)-1 + sizeof(iphdr) + sizeof(udphdr) + len-HEADER_LEN;
-    if (fwrite(&tot_len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // length of captured packet data
-    if (fwrite(&tot_len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // un-truncated length of captured packet data
+      FILE* fh = csid2fd[csid].second;
+      // pcap-savefile timestamp
+      if (fwrite(&ts.tv_sec, 4, 1, fh) != 1) err(EX_IOERR, "fwrite");
+      if (fwrite(&ts.tv_usec, 4, 1, fh) != 1) err(EX_IOERR, "fwrite");
 
-    // Ethernet header
-    if (fwrite(ETHERNET_HEADER, sizeof ETHERNET_HEADER-1, 1, fh) != 1) err(EX_IOERR, "fwrite");
+      // pcap-savefile length
+      uint32_t tot_len = sizeof(ETHERNET_HEADER)-1 + sizeof(iphdr) + sizeof(udphdr) + len-HEADER_LEN;
+      if (fwrite(&tot_len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // length of captured packet data
+      if (fwrite(&tot_len, 4, 1, fh) != 1) err(EX_IOERR, "fwrite"); // un-truncated length of captured packet data
 
-    // IP header denoting 'side'
-    ip.id = htons(ip_id++);
-    ip.tot_len = htons(tot_len - (sizeof(ETHERNET_HEADER)-1));
-    if (side) {
-      //ip.saddr = 0xffffffff;
-      //ip.daddr = 0x00000000;
-      ip.saddr = htonl(~ connection_id);
-      ip.daddr = htonl(connection_id);
-    } else {
-      //ip.saddr = 0x00000000;
-      //ip.daddr = 0xffffffff;
-      ip.saddr = htonl(connection_id);
-      ip.daddr = htonl(~ connection_id);
-    }
-    //ip.check = in_cksum((unsigned short*)&ip, sizeof ip);
-    if (fwrite(&ip, sizeof ip, 1, fh) != 1) err(EX_IOERR, "fwrite");
+      // Ethernet header
+      if (fwrite(ETHERNET_HEADER, sizeof ETHERNET_HEADER-1, 1, fh) != 1) err(EX_IOERR, "fwrite");
 
-    // UDP header denoting 'connection_id'
-    if (side) {
-      //udp.source = htons(connection_id & 0xffff);
-      //udp.dest = htons(connection_id >> 16 & 0xffff);
-    } else {
-      //udp.source = htons(connection_id >> 16 & 0xffff);
-      //udp.dest = htons(connection_id & 0xffff);
-    }
+      // IP header denoting 'side'
+      ip.id = htons(ip_id++);
+      ip.tot_len = htons(tot_len - (sizeof(ETHERNET_HEADER)-1));
+      if (side) {
+        ip.saddr = 0xffffffff;
+        ip.daddr = 0x00000000;
+      } else {
+        ip.saddr = 0x00000000;
+        ip.daddr = 0xffffffff;
+      }
+      //ip.check = in_cksum((unsigned short*)&ip, sizeof ip);
+      if (fwrite(&ip, sizeof ip, 1, fh) != 1) err(EX_IOERR, "fwrite");
 
-    // if '!' is removed, wireshark may misidentify the direction of the first packet from the other side
-    udp.source = ! side ? 0xffff : 0;
-    udp.dest = ~ udp.source;
+      // UDP header denoting 'connection_id'
+      udp.source = htons((connection_id / 65535 % 65535 + 1));
+      udp.dest = htons(connection_id % 65535 + 1);
+      if (side)
+        swap(udp.source, udp.dest);
 
-    udp.len = htons(ntohs(ip.tot_len) - sizeof ip);
-    if (fwrite(&udp, sizeof udp, 1, fh) != 1) err(EX_IOERR, "fwrite");
+      udp.len = htons(ntohs(ip.tot_len) - sizeof ip);
+      if (fwrite(&udp, sizeof udp, 1, fh) != 1) err(EX_IOERR, "fwrite");
 
-    if (fwrite(buf+HEADER_LEN, len-HEADER_LEN, 1, fh) != 1) err(EX_IOERR, "fwrite");
-    if (ftello(fh) > capture_buffer_size) {
-      if (fclose(fh) < 0) err(EX_IOERR, "fclose");
-      csid2fd[csid].second = NULL;
-    } else {
-      if (fflush(fh) < 0) err(EX_IOERR, "fflush");
+      if (fwrite(buf+HEADER_LEN, len-HEADER_LEN, 1, fh) != 1) err(EX_IOERR, "fwrite");
+      if (ftello(fh) > capture_buffer_size) {
+        if (fclose(fh) < 0) err(EX_IOERR, "fclose");
+        csid2fd[csid].second = NULL;
+      } else {
+        if (fflush(fh) < 0) err(EX_IOERR, "fflush");
+      }
     }
   }
 }

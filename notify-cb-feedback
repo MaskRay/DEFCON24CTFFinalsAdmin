@@ -2,27 +2,43 @@
 #action=echo
 action=~/DEF/cgc/raybot.py
 
-declare -A state
+declare -A state state2
 
 cnt=0
 while :; do
   json=$(curl -sS 'http://bloop:neiman marcus and 654321 on rye@10.3.1.21/status')
   round=$(jq .round <<< $json)
   if [[ $round =~ [0-9]+ ]]; then
+    ((round--))
     json=$(curl -sS "http://bloop:neiman marcus and 654321 on rye@10.3.1.21/round/$round/feedback/cb")
     if [[ -n $json ]]; then
-      sign=()
+      state2=()
+      inc=()
+      dec=()
       jq -r '.cb[]|"\(.timestamp)\t\(.signal)\t\(.csid)\t\(.cbid)"' <<< $json | while read timestamp signal csid cbid; do
-        if [[ ${state[$csid]} != $signal ]]; then
-          sign=("${sign[@]}" $csid:$signal)
-          state[$csid]=$signal
+        state2[$csid:$signal]=1
+      done
+
+      for k in ${(k)state2}; do
+        if [[ ${state[$k]} != 1 ]]; then
+          inc=("${inc[@]}" $k)
         fi
       done
+
+      for k in ${(k)state}; do
+        if [[ ${state2[$k]} != 1 ]]; then
+          dec=("${dec[@]}" $k)
+        fi
+      done
+
+      state=("${(kv)state2[@]}")
+
       if ((cnt > 0)); then
-        if (( $#sig > 0 )); then $action "signal: ${(o)sign[*]}"; fi
+        if (( $#inc > 0 )); then $action "round: $round more signals: ${inc[*]}"; fi
+        if (( $#dec > 0 )); then $action "round: $round less signals: ${dec[*]}"; fi
       fi
       ((cnt++))
     fi
   fi
-  sleep 100
+  sleep 1
 done
